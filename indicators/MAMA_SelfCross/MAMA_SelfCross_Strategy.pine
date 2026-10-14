@@ -6,6 +6,7 @@
 //  ・シグナルは足の確定で判定し、注文は次の足の始値で約定（TradingView の既定）
 //  ・手法    : 相互監視（自己相関クロス） / パターンB（短期MAMA × 長期MA） / パターンC（短期MA × 長期MA）
 //  ・決済    : 逆クロス ＋ 損切り（直近の安値・高値 / ATR 倍）＋ 任意で利確（ATR 倍）
+//  ・トレーリング : ATR / 直近安値・高値 / 移動平均線 / 値幅 で損切りを追いかける。建値ストップも可
 //  ・スプレッドは再現されないので、プロパティの「スリッページ」に片道ぶん
 //    （スプレッドの半分）をティックで入れておくと実際に近くなる
 //  ・証拠金率は 4%（国内FXのレバレッジ 25 倍）。100% のままだと、資金 100% の売りが
@@ -46,10 +47,22 @@ string SL_NONE  = "なし（逆クロスのみ）"
 string SL_SWING = "直近の安値・高値"
 string SL_ATR   = "ATR 倍"
 
+string TR_NONE  = "なし"
+string TR_ATR   = "ATR（最高値から ATR × n）"
+string TR_SWING = "直近 N 本の安値・高値"
+string TR_MA    = "移動平均線"
+string TR_PRICE = "値幅（最高値から一定の値幅）"
+
+string TL_FAST   = "短期MA"
+string TL_FASTMM = "短期MAMA"
+string TL_SLOW   = "長期MA"
+string TL_SLOWMM = "長期MAMA"
+
 string G_SYS  = "手法"
 string G_MA   = "移動平均"
 string G_SIG  = "相互監視の設定"
 string G_RISK = "損切り・利確"
+string G_TRAIL = "トレーリングストップ・建値ストップ"
 string G_TEST = "検証期間"
 string G_VIS  = "表示"
 
@@ -76,6 +89,16 @@ float  slAtr     = input.float(2.0, "損切り（ATR 倍）※ATR 倍のとき",
 float  tpAtr     = input.float(0.0, "利確（ATR 倍、0 = なし）", minval = 0, step = 0.5, group = G_RISK, tooltip = "原典では「絶対クローズ条件は逆クロスだけ、利食いは適当でいい」。0 のままなら逆クロスだけで決済する。")
 int    atrLen    = input.int(14, "ATR 期間", minval = 1, group = G_RISK)
 
+string trailMode   = input.string(TR_NONE, "トレーリング方式", options = [TR_NONE, TR_ATR, TR_SWING, TR_MA, TR_PRICE], group = G_TRAIL, tooltip = "利益が乗ったら損切りを有利な方向へ追いかけて動かし、利益を守りながら伸ばす。足が確定するごとに更新し、不利な方向へは動かさない。")
+float  trailStart  = input.float(1.0, "開始：含み益が ATR × いくつで（0 = すぐ）", minval = 0, step = 0.25, group = G_TRAIL, tooltip = "エントリー後の最大含み益が、エントリー時の ATR のこの倍数に達したらトレーリングを始める。始まるまでは最初の損切りのまま。")
+float  trailAtr    = input.float(2.0, "ATR 方式の幅（ATR × n）", minval = 0.1, step = 0.25, group = G_TRAIL, tooltip = "エントリー後の最高値（売りは最安値）から ATR × n 離れた位置に損切りを置く。")
+int    trailLen    = input.int(5, "直近安値・高値方式の本数", minval = 1, group = G_TRAIL, tooltip = "直近 N 本の最安値（売りは最高値）に損切りを置く。")
+string trailMaSel  = input.string(TL_SLOW, "移動平均線方式で使う線", options = [TL_FAST, TL_FASTMM, TL_SLOW, TL_SLOWMM], group = G_TRAIL, tooltip = "選んだ線の位置に損切りを置く（線を割ったら決済）。")
+float  trailPrice  = input.float(5.0, "値幅方式の幅（価格）", minval = 0, step = 0.5, group = G_TRAIL, tooltip = "エントリー後の最高値（売りは最安値）からこの値幅だけ離れた位置に損切りを置く。金なら 5 = 5 ドル。")
+bool   ignoreCross = input.bool(false, "トレーリング開始後は逆クロスで決済しない", group = G_TRAIL, tooltip = "オンにすると、トレーリングが始まった後の決済はトレーリングに任せる。反対方向のエントリーサインが出たときはドテンする。")
+float  beTrig      = input.float(0.0, "建値ストップ：含み益が ATR × いくつで（0 = 使わない）", minval = 0, step = 0.25, group = G_TRAIL, tooltip = "エントリー後の最大含み益がエントリー時の ATR のこの倍数に達したら、損切りを建値（エントリー価格）まで引き上げる。")
+float  beOffset    = input.float(0.0, "建値ストップの上乗せ（価格）", minval = 0, step = 0.1, group = G_TRAIL, tooltip = "建値ちょうどではなく、この値幅だけ有利な位置に置く。スプレッド分（例 0.3）を入れると実質トントンで逃げられる。")
+
 int    startTime = input.time(timestamp("01 Jan 2000 00:00 +0000"), "開始", group = G_TEST)
 int    endTime   = input.time(timestamp("01 Jan 2100 00:00 +0000"), "終了", group = G_TEST)
 
@@ -96,6 +119,7 @@ color C_UP     = #00E5FF
 color C_DN     = #FF3B3B
 color C_BUY    = #1E90FF
 color C_SELL   = #FF4500
+color C_TRAIL  = #FFC107
 
 // ---------------------------------------------------------------- 計算（インジケーター版と同じ）
 ma(float s, simple int len, simple string t) =>
@@ -119,6 +143,9 @@ float trendMA  = ma(src, trendLen, maType)
 float atr      = ta.atr(atrLen)
 float swingLow  = ta.lowest(low, swingLen)
 float swingHigh = ta.highest(high, swingLen)
+float trailLow  = ta.lowest(low, trailLen)
+float trailHigh = ta.highest(high, trailLen)
+float trailLine = trailMaSel == TL_FAST ? fastMA : trailMaSel == TL_FASTMM ? fastMAMA : trailMaSel == TL_SLOWMM ? slowMAMA : slowMA
 
 var int fastDir = 0
 var int slowDir = 0
@@ -170,6 +197,41 @@ var float longStop  = na     // 損切り・利確の価格（エントリーの
 var float longLimit = na
 var float shortStop  = na
 var float shortLimit = na
+var float entryAtr   = na    // エントリー時の ATR（トレーリング・建値ストップの開始判定に使う）
+
+// トレーリング・建値ストップの状態
+var float longPeak     = na  // 建玉後の最高値
+var float longTrail    = na  // トレール価格（上にしか動かない）
+var bool  longTrailOn  = false
+var bool  longBeOn     = false
+var float shortPeak    = na  // 建玉後の最安値
+var float shortTrail   = na  // トレール価格（下にしか動かない）
+var bool  shortTrailOn = false
+var bool  shortBeOn    = false
+
+// 保有中は足が確定するごとに最高値（売りは最安値）を更新し、建値ストップとトレーリングを判定する
+if pos == 1
+    longPeak := na(longPeak) ? high : math.max(longPeak, high)
+    float gainL = longPeak - strategy.position_avg_price
+    if beTrig > 0 and not longBeOn and gainL >= beTrig * entryAtr
+        longBeOn := true
+    if trailMode != TR_NONE and not longTrailOn and (trailStart == 0 or gainL >= trailStart * entryAtr)
+        longTrailOn := true
+    if longTrailOn
+        float candL = trailMode == TR_ATR ? longPeak - trailAtr * atr : trailMode == TR_SWING ? trailLow : trailMode == TR_MA ? trailLine : longPeak - trailPrice
+        if not na(candL)
+            longTrail := na(longTrail) ? candL : math.max(longTrail, candL)
+if pos == -1
+    shortPeak := na(shortPeak) ? low : math.min(shortPeak, low)
+    float gainS = strategy.position_avg_price - shortPeak
+    if beTrig > 0 and not shortBeOn and gainS >= beTrig * entryAtr
+        shortBeOn := true
+    if trailMode != TR_NONE and not shortTrailOn and (trailStart == 0 or gainS >= trailStart * entryAtr)
+        shortTrailOn := true
+    if shortTrailOn
+        float candS = trailMode == TR_ATR ? shortPeak + trailAtr * atr : trailMode == TR_SWING ? trailHigh : trailMode == TR_MA ? trailLine : shortPeak + trailPrice
+        if not na(candS)
+            shortTrail := na(shortTrail) ? candS : math.min(shortTrail, candS)
 
 bool exitLongSig  = isCross ? crossDn : exitMode == EX_SLOW ? slowDn : exitMode == EX_FAST ? fastDn : (exitMode == EX_AUTO and posKind == 1) ? slowDn : (fastDn or slowDn)
 bool exitShortSig = isCross ? crossUp : exitMode == EX_SLOW ? slowUp : exitMode == EX_FAST ? fastUp : (exitMode == EX_AUTO and posKind == 1) ? slowUp : (fastUp or slowUp)
@@ -177,8 +239,8 @@ bool exitShortSig = isCross ? crossUp : exitMode == EX_SLOW ? slowUp : exitMode 
 bool inRange = time >= startTime and time <= endTime
 bool doLong  = inRange and direction != D_SHORT and longTrig and pos != 1
 bool doShort = inRange and direction != D_LONG and shortTrig and pos != -1
-bool doExitL = pos == 1 and exitLongSig
-bool doExitS = pos == -1 and exitShortSig
+bool doExitL = pos == 1 and exitLongSig and not (ignoreCross and longTrailOn)
+bool doExitS = pos == -1 and exitShortSig and not (ignoreCross and shortTrailOn)
 
 // 反対方向のエントリーはドテン（strategy.entry が決済も兼ねる）ので、決済注文は出さない
 if doExitL and not doShort
@@ -191,19 +253,46 @@ if doLong
     posKind   := (not isCross and useSlowTrig and longBySlow) ? 1 : 2
     longStop  := slMode == SL_SWING ? swingLow - slBuffer * syminfo.mintick : slMode == SL_ATR ? close - slAtr * atr : na
     longLimit := tpAtr > 0 ? close + tpAtr * atr : na
+    entryAtr  := atr
+    longPeak    := na
+    longTrail   := na
+    longTrailOn := false
+    longBeOn    := false
 if doShort
     strategy.entry("Short", strategy.short, comment = "売り")
     posKind    := (not isCross and useSlowTrig and shortBySlow) ? 1 : 2
     shortStop  := slMode == SL_SWING ? swingHigh + slBuffer * syminfo.mintick : slMode == SL_ATR ? close + slAtr * atr : na
     shortLimit := tpAtr > 0 ? close - tpAtr * atr : na
+    entryAtr   := atr
+    shortPeak    := na
+    shortTrail   := na
+    shortTrailOn := false
+    shortBeOn    := false
 
-// 損切り・利確。サインが出た足で決めた価格に置き、保有中は毎足同じ価格で出し直す
+// 実際に置く損切り = 最初の損切り・建値ストップ・トレールのうち一番有利なもの
+float longStopEff = longStop
+if longBeOn
+    float beL = strategy.position_avg_price + beOffset
+    longStopEff := na(longStopEff) ? beL : math.max(longStopEff, beL)
+if longTrailOn and not na(longTrail)
+    longStopEff := na(longStopEff) ? longTrail : math.max(longStopEff, longTrail)
+float shortStopEff = shortStop
+if shortBeOn
+    float beS = strategy.position_avg_price - beOffset
+    shortStopEff := na(shortStopEff) ? beS : math.min(shortStopEff, beS)
+if shortTrailOn and not na(shortTrail)
+    shortStopEff := na(shortStopEff) ? shortTrail : math.min(shortStopEff, shortTrail)
+
+string longExitCmt  = longTrailOn ? "トレール" : longBeOn ? "建値" : "損切り"
+string shortExitCmt = shortTrailOn ? "トレール" : shortBeOn ? "建値" : "損切り"
+
+// 損切り・利確の注文。保有中は毎足、その時点の価格で出し直す
 bool longActive  = doLong or (pos == 1 and not doShort)
 bool shortActive = doShort or (pos == -1 and not doLong)
-if longActive and (not na(longStop) or not na(longLimit))
-    strategy.exit("Long SL/TP", from_entry = "Long", stop = longStop, limit = longLimit, comment_loss = "損切り", comment_profit = "利確")
-if shortActive and (not na(shortStop) or not na(shortLimit))
-    strategy.exit("Short SL/TP", from_entry = "Short", stop = shortStop, limit = shortLimit, comment_loss = "損切り", comment_profit = "利確")
+if longActive and (not na(longStopEff) or not na(longLimit))
+    strategy.exit("Long SL/TP", from_entry = "Long", stop = longStopEff, limit = longLimit, comment_loss = longExitCmt, comment_profit = "利確")
+if shortActive and (not na(shortStopEff) or not na(shortLimit))
+    strategy.exit("Short SL/TP", from_entry = "Short", stop = shortStopEff, limit = shortLimit, comment_loss = shortExitCmt, comment_profit = "利確")
 
 // 検証期間が終わったら手じまい
 if time > endTime and strategy.position_size != 0
@@ -225,8 +314,8 @@ float crossY = isB ? (fastMAMA + slowMA) / 2 : (fastMA + slowMA) / 2
 plotchar(showArrow and isCross and crossUp ? crossY : na, title = "クロス↑（パターンB・C）", char = "○", location = location.absolute, color = C_UP, size = size.small)
 plotchar(showArrow and isCross and crossDn ? crossY : na, title = "クロス↓（パターンB・C）", char = "○", location = location.absolute, color = C_DN, size = size.small)
 
-plot(showStop and longActive ? longStop : na, "損切り（買い）", color = C_DN, style = plot.style_linebr, linewidth = 1)
-plot(showStop and shortActive ? shortStop : na, "損切り（売り）", color = C_DN, style = plot.style_linebr, linewidth = 1)
+plot(showStop and longActive ? longStopEff : na, "損切り・トレール（買い）", color = longTrailOn or longBeOn ? C_TRAIL : C_DN, style = plot.style_linebr, linewidth = 1)
+plot(showStop and shortActive ? shortStopEff : na, "損切り・トレール（売り）", color = shortTrailOn or shortBeOn ? C_TRAIL : C_DN, style = plot.style_linebr, linewidth = 1)
 plot(showStop and longActive ? longLimit : na, "利確（買い）", color = C_UP, style = plot.style_linebr, linewidth = 1)
 plot(showStop and shortActive ? shortLimit : na, "利確（売り）", color = C_UP, style = plot.style_linebr, linewidth = 1)
 
@@ -234,7 +323,7 @@ bgcolor(showZone and pos == 1 ? color.new(C_BUY, 90) : showZone and pos == -1 ? 
 
 // ---------------------------------------------------------------- 成績パネル（詳細はストラテジーテスターで）
 string statsPosition = statsLoc == "右上" ? position.top_right : statsLoc == "左上" ? position.top_left : statsLoc == "左下" ? position.bottom_left : position.bottom_right
-var table stats = table.new(statsPosition, 2, 8, bgcolor = color.new(#000000, 20), frame_color = color.new(#808080, 40), frame_width = 1, border_color = color.new(#808080, 70), border_width = 1)
+var table stats = table.new(statsPosition, 2, 9, bgcolor = color.new(#000000, 20), frame_color = color.new(#808080, 40), frame_width = 1, border_color = color.new(#808080, 70), border_width = 1)
 
 statRow(table t, int row, string label, string value, color valueColor) =>
     table.cell(t, 0, row, label, text_color = color.silver, text_size = size.small, text_halign = text.align_left)
@@ -257,3 +346,5 @@ if showStats and barstate.islast
     statRow(stats, 6, "保有中", pos == 1 ? "買い" : pos == -1 ? "売り" : "なし", pos == 1 ? C_BUY : pos == -1 ? C_SELL : color.gray)
     string slTxt  = slMode == SL_SWING ? "直近 " + str.tostring(swingLen) + " 本の安値・高値" : slMode == SL_ATR ? "ATR × " + str.tostring(slAtr) : "なし"
     statRow(stats, 7, "損切り", slTxt, color.white)
+    string trTxt  = trailMode == TR_NONE ? "なし" : trailMode == TR_ATR ? "ATR × " + str.tostring(trailAtr) : trailMode == TR_SWING ? "直近 " + str.tostring(trailLen) + " 本" : trailMode == TR_MA ? trailMaSel : "値幅 " + str.tostring(trailPrice)
+    statRow(stats, 8, "トレール", trTxt + (beTrig > 0 ? " ＋ 建値" : ""), color.white)
