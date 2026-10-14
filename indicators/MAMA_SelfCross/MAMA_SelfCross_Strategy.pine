@@ -5,7 +5,7 @@
 //  インジケーター版（MAMA_SelfCross.pine）と同じロジックで売買する。
 //  ・シグナルは足の確定で判定し、注文は次の足の始値で約定（TradingView の既定）
 //  ・手法    : 相互監視（自己相関クロス） / パターンB（短期MAMA × 長期MA）
-//  ・決済    : 逆クロス（＋任意で ATR 倍の損切り・利確）
+//  ・決済    : 逆クロス ＋ 損切り（直近の安値・高値 / ATR 倍）＋ 任意で利確（ATR 倍）
 //  ・スプレッドは再現されないので、プロパティの「スリッページ」に片道ぶん
 //    （スプレッドの半分）をティックで入れておくと実際に近くなる
 //  ・証拠金率は 4%（国内FXのレバレッジ 25 倍）。100% のままだと、資金 100% の売りが
@@ -41,10 +41,14 @@ string TF_OFF   = "OFF"
 string TF_PRICE = "価格がトレンドMAの上なら買いのみ／下なら売りのみ"
 string TF_SLOPE = "トレンドMAの傾きの方向のみ"
 
+string SL_NONE  = "なし（逆クロスのみ）"
+string SL_SWING = "直近の安値・高値"
+string SL_ATR   = "ATR 倍"
+
 string G_SYS  = "手法"
 string G_MA   = "移動平均"
 string G_SIG  = "相互監視の設定"
-string G_RISK = "損切り・利確（任意）"
+string G_RISK = "損切り・利確"
 string G_TEST = "検証期間"
 string G_VIS  = "表示"
 
@@ -64,7 +68,10 @@ int    trendLen  = input.int(200, "", minval = 1, group = G_MA, inline = "trend"
 string entryMode = input.string(EN_BOTH, "エントリー方式", options = [EN_BOTH, EN_BIG, EN_FINE], group = G_SIG, tooltip = "小→大：小矢印が出ている状態で大矢印が出たら入る（大きく取る）。大→小：大矢印が出ている状態で小矢印が出たら入る（細かく取る）。両方：どちらでも向きが揃った時点で入る。")
 string exitMode  = input.string(EX_AUTO, "決済条件", options = [EX_ANY, EX_SLOW, EX_FAST, EX_AUTO], group = G_SIG, tooltip = "自動：大矢印で入ったら長期の逆クロスまで持つ（大きく取る）、小矢印で入ったらどちらかの逆クロスで終了（細かく取る）。原典ルールは「エントリー後、どちらかの MA で逆向きクロスが出たら終了」。")
 
-float  slAtr     = input.float(0.0, "損切り（ATR 倍、0 = なし）", minval = 0, step = 0.5, group = G_RISK)
+string slMode    = input.string(SL_SWING, "損切り", options = [SL_NONE, SL_SWING, SL_ATR], group = G_RISK, tooltip = "直近の安値・高値：サインが出た足を含む直近 N 本の最安値（売りは最高値）に損切りを置き、そこを割ったら損切り。損切りの位置はエントリー時に固定。")
+int    swingLen  = input.int(10, "直近 何本の安値・高値", minval = 1, group = G_RISK)
+int    slBuffer  = input.int(0, "損切りの余裕（ティック）", minval = 0, group = G_RISK, tooltip = "安値ちょうどではなく、少し外側に損切りを置きたいときの幅。0 なら安値・高値ちょうど。")
+float  slAtr     = input.float(2.0, "損切り（ATR 倍）※ATR 倍のとき", minval = 0.1, step = 0.5, group = G_RISK)
 float  tpAtr     = input.float(0.0, "利確（ATR 倍、0 = なし）", minval = 0, step = 0.5, group = G_RISK, tooltip = "原典では「絶対クローズ条件は逆クロスだけ、利食いは適当でいい」。0 のままなら逆クロスだけで決済する。")
 int    atrLen    = input.int(14, "ATR 期間", minval = 1, group = G_RISK)
 
@@ -74,6 +81,7 @@ int    endTime   = input.time(timestamp("01 Jan 2100 00:00 +0000"), "終了", gr
 bool   showLines = input.bool(true, "MA / MAMA ライン", group = G_VIS)
 bool   showArrow = input.bool(true, "小矢印・大矢印（パターンB のときは ○）", group = G_VIS)
 bool   showZone  = input.bool(false, "保有中の背景色", group = G_VIS)
+bool   showStop  = input.bool(true, "損切り・利確ライン", group = G_VIS)
 bool   showStats = input.bool(true, "成績パネル", group = G_VIS, inline = "stats")
 string statsLoc  = input.string("右下", "", options = ["右上", "右下", "左上", "左下"], group = G_VIS, inline = "stats")
 
@@ -108,6 +116,8 @@ float slowMA   = ma(src, slowLen, maType)
 float slowMAMA = ma(slowMA, slowLen, mamaType)
 float trendMA  = ma(src, trendLen, maType)
 float atr      = ta.atr(atrLen)
+float swingLow  = ta.lowest(low, swingLen)
+float swingHigh = ta.highest(high, swingLen)
 
 var int fastDir = 0
 var int slowDir = 0
@@ -146,7 +156,10 @@ bool shortTrig = (isB ? bDn : mutualShort) and trendDnOk
 int pos = strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0
 
 var int   posKind  = 0      // 1 = 大矢印で建てた、2 = 小矢印で建てた（決済条件「自動」用）
-var float entryAtr = na     // エントリー時の ATR（損切り・利確の幅）
+var float longStop  = na     // 損切り・利確の価格（エントリーのサインが出た足で決めて固定）
+var float longLimit = na
+var float shortStop  = na
+var float shortLimit = na
 
 bool exitLongSig  = isB ? bDn : exitMode == EX_SLOW ? slowDn : exitMode == EX_FAST ? fastDn : (exitMode == EX_AUTO and posKind == 1) ? slowDn : (fastDn or slowDn)
 bool exitShortSig = isB ? bUp : exitMode == EX_SLOW ? slowUp : exitMode == EX_FAST ? fastUp : (exitMode == EX_AUTO and posKind == 1) ? slowUp : (fastUp or slowUp)
@@ -165,25 +178,22 @@ if doExitS and not doLong
 
 if doLong
     strategy.entry("Long", strategy.long, comment = "買い")
-    posKind  := (not isB and useSlowTrig and longBySlow) ? 1 : 2
-    entryAtr := atr
+    posKind   := (not isB and useSlowTrig and longBySlow) ? 1 : 2
+    longStop  := slMode == SL_SWING ? swingLow - slBuffer * syminfo.mintick : slMode == SL_ATR ? close - slAtr * atr : na
+    longLimit := tpAtr > 0 ? close + tpAtr * atr : na
 if doShort
     strategy.entry("Short", strategy.short, comment = "売り")
-    posKind  := (not isB and useSlowTrig and shortBySlow) ? 1 : 2
-    entryAtr := atr
+    posKind    := (not isB and useSlowTrig and shortBySlow) ? 1 : 2
+    shortStop  := slMode == SL_SWING ? swingHigh + slBuffer * syminfo.mintick : slMode == SL_ATR ? close + slAtr * atr : na
+    shortLimit := tpAtr > 0 ? close - tpAtr * atr : na
 
-// 損切り・利確（ATR 倍）。エントリーした足は終値、約定後は平均取得単価を基準にする
-if (slAtr > 0 or tpAtr > 0) and not na(entryAtr)
-    if doLong or (pos == 1 and not doShort)
-        float baseL = doLong ? close : strategy.position_avg_price
-        float stopL = slAtr > 0 ? baseL - slAtr * entryAtr : na
-        float limL  = tpAtr > 0 ? baseL + tpAtr * entryAtr : na
-        strategy.exit("Long SL/TP", from_entry = "Long", stop = stopL, limit = limL, comment_loss = "損切り", comment_profit = "利確")
-    if doShort or (pos == -1 and not doLong)
-        float baseS = doShort ? close : strategy.position_avg_price
-        float stopS = slAtr > 0 ? baseS + slAtr * entryAtr : na
-        float limS  = tpAtr > 0 ? baseS - tpAtr * entryAtr : na
-        strategy.exit("Short SL/TP", from_entry = "Short", stop = stopS, limit = limS, comment_loss = "損切り", comment_profit = "利確")
+// 損切り・利確。サインが出た足で決めた価格に置き、保有中は毎足同じ価格で出し直す
+bool longActive  = doLong or (pos == 1 and not doShort)
+bool shortActive = doShort or (pos == -1 and not doLong)
+if longActive and (not na(longStop) or not na(longLimit))
+    strategy.exit("Long SL/TP", from_entry = "Long", stop = longStop, limit = longLimit, comment_loss = "損切り", comment_profit = "利確")
+if shortActive and (not na(shortStop) or not na(shortLimit))
+    strategy.exit("Short SL/TP", from_entry = "Short", stop = shortStop, limit = shortLimit, comment_loss = "損切り", comment_profit = "利確")
 
 // 検証期間が終わったら手じまい
 if time > endTime and strategy.position_size != 0
@@ -204,11 +214,16 @@ plotshape(arrowsOn and slowDn, title = "大矢印↓", style = shape.arrowdown, 
 plotchar(showArrow and isB and bUp ? (fastMAMA + slowMA) / 2 : na, title = "パターンB↑", char = "○", location = location.absolute, color = C_UP, size = size.small)
 plotchar(showArrow and isB and bDn ? (fastMAMA + slowMA) / 2 : na, title = "パターンB↓", char = "○", location = location.absolute, color = C_DN, size = size.small)
 
+plot(showStop and longActive ? longStop : na, "損切り（買い）", color = C_DN, style = plot.style_linebr, linewidth = 1)
+plot(showStop and shortActive ? shortStop : na, "損切り（売り）", color = C_DN, style = plot.style_linebr, linewidth = 1)
+plot(showStop and longActive ? longLimit : na, "利確（買い）", color = C_UP, style = plot.style_linebr, linewidth = 1)
+plot(showStop and shortActive ? shortLimit : na, "利確（売り）", color = C_UP, style = plot.style_linebr, linewidth = 1)
+
 bgcolor(showZone and pos == 1 ? color.new(C_BUY, 90) : showZone and pos == -1 ? color.new(C_SELL, 90) : na, title = "保有中")
 
 // ---------------------------------------------------------------- 成績パネル（詳細はストラテジーテスターで）
 string statsPosition = statsLoc == "右上" ? position.top_right : statsLoc == "左上" ? position.top_left : statsLoc == "左下" ? position.bottom_left : position.bottom_right
-var table stats = table.new(statsPosition, 2, 7, bgcolor = color.new(#000000, 20), frame_color = color.new(#808080, 40), frame_width = 1, border_color = color.new(#808080, 70), border_width = 1)
+var table stats = table.new(statsPosition, 2, 8, bgcolor = color.new(#000000, 20), frame_color = color.new(#808080, 40), frame_width = 1, border_color = color.new(#808080, 70), border_width = 1)
 
 statRow(table t, int row, string label, string value, color valueColor) =>
     table.cell(t, 0, row, label, text_color = color.silver, text_size = size.small, text_halign = text.align_left)
@@ -229,3 +244,5 @@ if showStats and barstate.islast
     statRow(stats, 4, "純利益", str.tostring(strategy.netprofit, "0") + "（" + str.tostring(netPct, "0.0") + " %）", strategy.netprofit >= 0 ? C_UP : C_DN)
     statRow(stats, 5, "最大DD", str.tostring(strategy.max_drawdown, "0") + "（初期資金比 " + str.tostring(ddPct, "0.0") + " %）", C_DN)
     statRow(stats, 6, "保有中", pos == 1 ? "買い" : pos == -1 ? "売り" : "なし", pos == 1 ? C_BUY : pos == -1 ? C_SELL : color.gray)
+    string slTxt  = slMode == SL_SWING ? "直近 " + str.tostring(swingLen) + " 本の安値・高値" : slMode == SL_ATR ? "ATR × " + str.tostring(slAtr) : "なし"
+    statRow(stats, 7, "損切り", slTxt, color.white)
