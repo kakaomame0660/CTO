@@ -1,0 +1,373 @@
+//@version=6
+// =============================================================================
+//  MAMA 設定比較 — いろいろな設定を一度に検証して、成績を表で並べる
+// -----------------------------------------------------------------------------
+//  ストラテジー版（MAMA_SelfCross_Strategy.pine）と同じ売買ルールを、
+//  手法 5 種 × 期間 最大 3 種 × 決済 3 種 ＝ 最大 45 通り、同時にシミュレーションする。
+//  ・確定足で判定 → 次の足の始値で約定。損切りは足の中で判定（始値で割っていたら始値で約定）
+//  ・コストは「1 オンスあたり片道の手数料（スプレッドの半分）× 数量」をエントリーと決済で引く
+//  ・数量は固定（複利なし）。資金がゼロ以下になった設定は「破綻」として止める
+//  ・最大DD は足の中の一番不利な値動きで計算する（保守的）
+//  ・時間足はチャートの時間足。30分足・1時間足…と切り替えて比べる
+//  ※ ストラテジーテスターとは細かい約定の扱いが違うので、数字は少しずれる。
+//    良さそうな設定を見つけたら、ストラテジーで確認する
+// =============================================================================
+indicator("MAMA 設定比較", shorttitle = "MAMA 比較", overlay = true)
+
+// ---------------------------------------------------------------- 選択肢
+string T_SMA  = "SMA"
+string T_EMA  = "EMA"
+string T_SMMA = "SMMA (RMA)"
+string T_WMA  = "WMA"
+
+string TF_OFF   = "OFF"
+string TF_PRICE = "価格がトレンドMAの上なら買いのみ／下なら売りのみ"
+string TF_SLOPE = "トレンドMAの傾きの方向のみ"
+
+string SORT_RATIO = "純利益 ÷ 最大DD"
+string SORT_PF    = "PF"
+string SORT_NET   = "純利益"
+
+string G_COND = "検証の条件"
+string G_GRID = "比べる設定"
+string G_VIEW = "表示"
+
+// ---------------------------------------------------------------- 入力
+float  qty      = input.float(1.0, "数量（オンス）", minval = 0.01, step = 0.1, group = G_COND, tooltip = "OANDA の XAUUSD は 1 = 1 オンス。1 ロット＝100 オンスの業者なら 0.01 ロット = 1、0.1 ロット = 10。")
+float  cost     = input.float(0.1, "手数料（1 オンスあたり片道）", minval = 0, step = 0.01, group = G_COND, tooltip = "スプレッドの半分。スプレッド 0.2 ドルなら 0.1。エントリーと決済でそれぞれ引く。")
+float  capital  = input.float(300, "初期資金", minval = 1, group = G_COND)
+int    startT   = input.time(timestamp("01 Jan 2025 00:00 +0000"), "検証開始", group = G_COND)
+int    splitT   = input.time(timestamp("01 Jan 2026 00:00 +0000"), "前半・後半の区切り", group = G_COND, tooltip = "この日より前を前半、後を後半として PF を別々に出す。両方で 1 を超える設定ほど信頼できる。")
+
+int    fastLen  = input.int(5, "短期の期間", minval = 1, group = G_GRID)
+bool   useA     = input.bool(true, "", group = G_GRID, inline = "a")
+int    slowA    = input.int(20, "長期の期間 A", minval = 1, group = G_GRID, inline = "a")
+bool   useB     = input.bool(true, "", group = G_GRID, inline = "b")
+int    slowB    = input.int(40, "長期の期間 B", minval = 1, group = G_GRID, inline = "b")
+bool   useC     = input.bool(true, "", group = G_GRID, inline = "c")
+int    slowC    = input.int(100, "長期の期間 C", minval = 1, group = G_GRID, inline = "c")
+string maType   = input.string(T_SMA, "MA の種類", options = [T_SMA, T_EMA, T_SMMA, T_WMA], group = G_GRID)
+int    swingLen = input.int(10, "損切り：直近 N 本の安値・高値", minval = 1, group = G_GRID)
+float  trailStart  = input.float(1.0, "トレール開始（含み益が ATR × n）", minval = 0, step = 0.25, group = G_GRID)
+float  trailAtr    = input.float(2.0, "トレール幅（最高値から ATR × n）", minval = 0.1, step = 0.25, group = G_GRID)
+bool   ignoreCross = input.bool(false, "トレール開始後は逆クロスで決済しない", group = G_GRID)
+string trendMode   = input.string(TF_OFF, "トレンドフィルター", options = [TF_OFF, TF_PRICE, TF_SLOPE], group = G_GRID)
+int    trendLen    = input.int(200, "トレンドMA の期間", minval = 1, group = G_GRID)
+int    atrLen      = input.int(14, "ATR の期間", minval = 1, group = G_GRID)
+
+string sortBy   = input.string(SORT_RATIO, "並べ替え", options = [SORT_RATIO, SORT_PF, SORT_NET], group = G_VIEW)
+int    topN     = input.int(20, "表示する行数", minval = 5, maxval = 45, group = G_VIEW)
+string tableLoc = input.string("中央", "表の位置", options = ["中央", "右上", "左上", "右下", "左下"], group = G_VIEW)
+
+// ---------------------------------------------------------------- 共通の計算
+ma(float s, simple int len, simple string t) =>
+    float vSma = ta.sma(s, len)
+    float vEma = ta.ema(s, len)
+    float vRma = ta.rma(s, len)
+    float vWma = ta.wma(s, len)
+    t == T_EMA ? vEma : t == T_SMMA ? vRma : t == T_WMA ? vWma : vSma
+
+dirOf(float a, float b, int prev) =>
+    a > b ? 1 : a < b ? -1 : prev
+
+float fMA  = ma(close, fastLen, maType)
+float fMM  = ma(fMA, fastLen, maType)
+float sA   = ma(close, slowA, maType)
+float sAmm = ma(sA, slowA, maType)
+float sB   = ma(close, slowB, maType)
+float sBmm = ma(sB, slowB, maType)
+float sC   = ma(close, slowC, maType)
+float sCmm = ma(sC, slowC, maType)
+float tMA  = ma(close, trendLen, maType)
+float atr  = ta.atr(atrLen)
+float swLo = ta.lowest(low, swingLen)
+float swHi = ta.highest(high, swingLen)
+
+// 向き（1 = 上、-1 = 下）。fd = 短期の自己相関、sd = 長期の自己相関、bd = 短期MAMA×長期MA、cd = 短期MA×長期MA
+var int fd  = 0
+var int sdA = 0
+var int sdB = 0
+var int sdC = 0
+var int bdA = 0
+var int bdB = 0
+var int bdC = 0
+var int cdA = 0
+var int cdB = 0
+var int cdC = 0
+fd  := dirOf(fMA, fMM, fd)
+sdA := dirOf(sA, sAmm, sdA)
+sdB := dirOf(sB, sBmm, sdB)
+sdC := dirOf(sC, sCmm, sdC)
+bdA := dirOf(fMM, sA, bdA)
+bdB := dirOf(fMM, sB, bdB)
+bdC := dirOf(fMM, sC, bdC)
+cdA := dirOf(fMA, sA, cdA)
+cdB := dirOf(fMA, sB, cdB)
+cdC := dirOf(fMA, sC, cdC)
+
+bool fUp  = fd == 1 and fd[1] == -1
+bool fDn  = fd == -1 and fd[1] == 1
+bool sUpA = sdA == 1 and sdA[1] == -1
+bool sDnA = sdA == -1 and sdA[1] == 1
+bool sUpB = sdB == 1 and sdB[1] == -1
+bool sDnB = sdB == -1 and sdB[1] == 1
+bool sUpC = sdC == 1 and sdC[1] == -1
+bool sDnC = sdC == -1 and sdC[1] == 1
+bool bUpA = bdA == 1 and bdA[1] == -1
+bool bDnA = bdA == -1 and bdA[1] == 1
+bool bUpB = bdB == 1 and bdB[1] == -1
+bool bDnB = bdB == -1 and bdB[1] == 1
+bool bUpC = bdC == 1 and bdC[1] == -1
+bool bDnC = bdC == -1 and bdC[1] == 1
+bool cUpA = cdA == 1 and cdA[1] == -1
+bool cDnA = cdA == -1 and cdA[1] == 1
+bool cUpB = cdB == 1 and cdB[1] == -1
+bool cDnB = cdB == -1 and cdB[1] == 1
+bool cUpC = cdC == 1 and cdC[1] == -1
+bool cDnC = cdC == -1 and cdC[1] == 1
+
+bool trendUpOk = trendMode == TF_PRICE ? close > tMA : trendMode == TF_SLOPE ? tMA > tMA[1] : true
+bool trendDnOk = trendMode == TF_PRICE ? close < tMA : trendMode == TF_SLOPE ? tMA < tMA[1] : true
+
+pickB(int k, bool a, bool b, bool c) =>
+    k == 0 ? a : k == 1 ? b : c
+
+pickI(int k, int a, int b, int c) =>
+    k == 0 ? a : k == 1 ? b : c
+
+// ---------------------------------------------------------------- 1 通り分のシミュレーション
+// sys : 0 = 相互監視（両方・自動）、1 = 相互監視（小→大・長期のみ）、2 = 相互監視（大→小・どちらか）、3 = パターンB、4 = パターンC
+// per : 0 / 1 / 2 = 長期の期間 A / B / C
+// ex  : 0 = 逆クロスのみ、1 = 損切り（直近 N 本）、2 = 損切り ＋ ATR トレール
+type Sim
+    int   sys
+    int   per
+    int   ex
+    int   pos      = 0
+    int   kind     = 0
+    int   pend     = 0
+    float avg      = na
+    float stop     = na
+    float initStop = na
+    float peak     = na
+    float trail    = na
+    bool  trailOn  = false
+    float entryAtr = na
+    float equity   = 0.0
+    float peakEq   = 0.0
+    float maxDD    = 0.0
+    float gp       = 0.0
+    float gl       = 0.0
+    float gp1      = 0.0
+    float gl1      = 0.0
+    float gp2      = 0.0
+    float gl2      = 0.0
+    int   n        = 0
+    int   wins     = 0
+    bool  bust     = false
+
+method closeAt(Sim this, float px) =>
+    float pnl = (px - this.avg) * this.pos * qty - 2 * cost * qty
+    this.equity := this.equity + pnl
+    this.n      := this.n + 1
+    if pnl > 0
+        this.wins := this.wins + 1
+        this.gp   := this.gp + pnl
+        if time < splitT
+            this.gp1 := this.gp1 + pnl
+        else
+            this.gp2 := this.gp2 + pnl
+    else
+        this.gl := this.gl - pnl
+        if time < splitT
+            this.gl1 := this.gl1 - pnl
+        else
+            this.gl2 := this.gl2 - pnl
+    this.pos  := 0
+    this.avg  := na
+    this.stop := na
+    pnl
+
+method advance(Sim this) =>
+    // 1) 前の足で出した注文を始値で約定（ドテンは決済してから新規）
+    if this.pend != 0
+        float newStop = this.stop
+        if this.pos != 0 and (this.pend == 2 or this.pend == -this.pos)
+            this.closeAt(open)
+        if this.pend == 1 or this.pend == -1
+            this.pos  := this.pend
+            this.avg  := open
+            this.stop := newStop
+        this.pend := 0
+
+    // 2) 損切り（足の中で判定。始値で割っていたら始値で約定）
+    if this.pos == 1 and not na(this.stop)
+        if open <= this.stop
+            this.closeAt(open)
+        else if low <= this.stop
+            this.closeAt(this.stop)
+    else if this.pos == -1 and not na(this.stop)
+        if open >= this.stop
+            this.closeAt(open)
+        else if high >= this.stop
+            this.closeAt(this.stop)
+
+    // 3) 確定足での判定（ストラテジーと同じ順番）
+    int  k   = this.per
+    bool su  = pickB(k, sUpA, sUpB, sUpC)
+    bool sdn = pickB(k, sDnA, sDnB, sDnC)
+    int  sdN = pickI(k, sdA, sdB, sdC)
+    bool isX = this.sys >= 3
+    bool xu  = this.sys == 3 ? pickB(k, bUpA, bUpB, bUpC) : pickB(k, cUpA, cUpB, cUpC)
+    bool xdn = this.sys == 3 ? pickB(k, bDnA, bDnB, bDnC) : pickB(k, cDnA, cDnB, cDnC)
+    bool uS  = this.sys != 2
+    bool uF  = this.sys != 1
+    bool lbs = su and fd == 1
+    bool lbf = fUp and sdN == 1
+    bool sbs = sdn and fd == -1
+    bool sbf = fDn and sdN == -1
+    bool lt  = (isX ? xu : (uS and lbs) or (uF and lbf)) and trendUpOk
+    bool st  = (isX ? xdn : (uS and sbs) or (uF and sbf)) and trendDnOk
+    bool xl  = isX ? xdn : this.sys == 1 ? sdn : this.sys == 2 ? (fDn or sdn) : this.kind == 1 ? sdn : (fDn or sdn)
+    bool xs  = isX ? xu : this.sys == 1 ? su : this.sys == 2 ? (fUp or su) : this.kind == 1 ? su : (fUp or su)
+
+    // トレール（保有中だけ。足が確定するごとに更新し、有利な方向にしか動かさない）
+    if this.ex == 2 and this.pos == 1
+        this.peak := na(this.peak) ? high : math.max(this.peak, high)
+        if not this.trailOn and (trailStart == 0 or this.peak - this.avg >= trailStart * this.entryAtr)
+            this.trailOn := true
+        if this.trailOn
+            float candL = this.peak - trailAtr * atr
+            this.trail := na(this.trail) ? candL : math.max(this.trail, candL)
+    else if this.ex == 2 and this.pos == -1
+        this.peak := na(this.peak) ? low : math.min(this.peak, low)
+        if not this.trailOn and (trailStart == 0 or this.avg - this.peak >= trailStart * this.entryAtr)
+            this.trailOn := true
+        if this.trailOn
+            float candS = this.peak + trailAtr * atr
+            this.trail := na(this.trail) ? candS : math.min(this.trail, candS)
+
+    bool doL  = lt and this.pos != 1 and time >= startT
+    bool doS  = st and this.pos != -1 and time >= startT
+    bool doXL = this.pos == 1 and xl and not (ignoreCross and this.trailOn)
+    bool doXS = this.pos == -1 and xs and not (ignoreCross and this.trailOn)
+    if doXL and not doS
+        this.pend := 2
+    if doXS and not doL
+        this.pend := 2
+    if doL
+        this.pend     := 1
+        this.kind     := (not isX and uS and lbs) ? 1 : 2
+        this.initStop := this.ex >= 1 ? swLo : na
+        this.entryAtr := atr
+        this.peak     := na
+        this.trail    := na
+        this.trailOn  := false
+    if doS
+        this.pend     := -1
+        this.kind     := (not isX and uS and sbs) ? 1 : 2
+        this.initStop := this.ex >= 1 ? swHi : na
+        this.entryAtr := atr
+        this.peak     := na
+        this.trail    := na
+        this.trailOn  := false
+
+    // 4) 次の足で使う損切り
+    if doL or doS
+        this.stop := this.initStop
+    else if this.pos != 0 and this.pend != 2
+        float eff = this.initStop
+        if this.trailOn and not na(this.trail)
+            eff := na(eff) ? this.trail : this.pos == 1 ? math.max(eff, this.trail) : math.min(eff, this.trail)
+        this.stop := eff
+    else
+        this.stop := na
+
+    // 5) 最大DD（足の中の一番不利な値で計算）と破綻の判定
+    float worst   = this.pos == 1 ? low : high
+    float openPnl = this.pos != 0 ? (worst - this.avg) * this.pos * qty - cost * qty : 0.0
+    float eq      = this.equity + openPnl
+    this.peakEq := math.max(this.peakEq, eq)
+    this.maxDD  := math.max(this.maxDD, this.peakEq - eq)
+    if capital + eq <= 0
+        this.bust := true
+    this
+
+var array<Sim> sims = array.new<Sim>()
+if barstate.isfirst
+    for sys = 0 to 4
+        for per = 0 to 2
+            bool on = per == 0 ? useA : per == 1 ? useB : useC
+            if on
+                for ex = 0 to 2
+                    sims.push(Sim.new(sys, per, ex))
+
+if barstate.isconfirmed
+    for s in sims
+        if not s.bust
+            s.advance()
+
+// ---------------------------------------------------------------- 結果の表
+sysName(int k) =>
+    k == 0 ? "相互監視 両方・自動" : k == 1 ? "相互監視 小→大・長期" : k == 2 ? "相互監視 大→小・どちらか" : k == 3 ? "B 短期MAMA×長期MA" : "C 短期MA×長期MA"
+
+exName(int k) =>
+    k == 0 ? "逆クロスのみ" : k == 1 ? "損切り" : "損切り＋トレール"
+
+perName(int k) =>
+    str.tostring(fastLen) + " / " + str.tostring(k == 0 ? slowA : k == 1 ? slowB : slowC)
+
+pfOf(float gp, float gl) =>
+    gl > 0 ? gp / gl : gp > 0 ? 99.0 : na
+
+pfText(float v) =>
+    na(v) ? "―" : v >= 99 ? "∞" : str.tostring(v, "0.00")
+
+color C_TXT  = #E6EDF3
+color C_SUB  = #9AA7B2
+color C_GOOD = #2EE6A6
+color C_BAD  = #FF5C5C
+
+string tablePosition = tableLoc == "右上" ? position.top_right : tableLoc == "左上" ? position.top_left : tableLoc == "右下" ? position.bottom_right : tableLoc == "左下" ? position.bottom_left : position.middle_center
+var table tb = table.new(tablePosition, 12, 48, bgcolor = color.new(#0E1216, 0), frame_color = color.new(#808080, 40), frame_width = 1, border_color = color.new(#808080, 75), border_width = 1)
+var array<string> hdr = array.from("順位", "手法", "期間", "決済", "回数", "勝率", "PF", "純利益", "最大DD（資金比）", "利益÷DD", "前半PF", "後半PF")
+
+if barstate.isfirst
+    table.merge_cells(tb, 0, 0, 11, 0)
+
+if barstate.islast
+    array<float> scores = array.new<float>()
+    int bustCount = 0
+    for s in sims
+        float pf = pfOf(s.gp, s.gl)
+        float sc = s.bust or s.n == 0 ? -1e9 : sortBy == SORT_PF ? nz(pf) : sortBy == SORT_NET ? s.equity : s.maxDD > 0 ? s.equity / s.maxDD : s.equity
+        scores.push(sc)
+        if s.bust
+            bustCount += 1
+    array<int> ranked = scores.sort_indices(order.descending)
+
+    string cond = "時間足 " + timeframe.period + "　数量 " + str.tostring(qty) + "　手数料（片道）" + str.tostring(cost) + "　資金 " + str.tostring(capital) + "　" + str.format_time(startT, "yyyy-MM-dd") + " から　全 " + str.tostring(sims.size()) + " 通り（破綻 " + str.tostring(bustCount) + "）　並べ替え：" + sortBy
+    table.cell(tb, 0, 0, cond, text_color = C_TXT, text_size = size.small, text_halign = text.align_left)
+    for c = 0 to 11
+        table.cell(tb, c, 1, hdr.get(c), text_color = C_SUB, text_size = size.small)
+
+    int rows = math.min(topN, sims.size())
+    for r = 0 to rows - 1
+        Sim s = sims.get(ranked.get(r))
+        float pf  = pfOf(s.gp, s.gl)
+        float pf1 = pfOf(s.gp1, s.gl1)
+        float pf2 = pfOf(s.gp2, s.gl2)
+        color netCol = s.bust ? C_BAD : s.equity >= 0 ? C_GOOD : C_BAD
+        int   row = r + 2
+        table.cell(tb, 0, row, str.tostring(r + 1), text_color = C_SUB, text_size = size.small)
+        table.cell(tb, 1, row, sysName(s.sys), text_color = C_TXT, text_size = size.small, text_halign = text.align_left)
+        table.cell(tb, 2, row, perName(s.per), text_color = C_TXT, text_size = size.small)
+        table.cell(tb, 3, row, exName(s.ex), text_color = C_TXT, text_size = size.small, text_halign = text.align_left)
+        table.cell(tb, 4, row, str.tostring(s.n), text_color = C_TXT, text_size = size.small)
+        table.cell(tb, 5, row, s.n > 0 ? str.tostring(100.0 * s.wins / s.n, "0.0") + "%" : "―", text_color = C_TXT, text_size = size.small)
+        table.cell(tb, 6, row, pfText(pf), text_color = na(pf) ? C_SUB : pf >= 1 ? C_GOOD : C_BAD, text_size = size.small)
+        table.cell(tb, 7, row, s.bust ? "破綻" : str.tostring(s.equity, "0.00"), text_color = netCol, text_size = size.small)
+        table.cell(tb, 8, row, str.tostring(s.maxDD, "0.00") + "（" + str.tostring(100 * s.maxDD / capital, "0") + "%）", text_color = s.maxDD > capital * 0.25 ? C_BAD : C_TXT, text_size = size.small)
+        table.cell(tb, 9, row, s.maxDD > 0 ? str.tostring(s.equity / s.maxDD, "0.0") : "―", text_color = C_TXT, text_size = size.small)
+        table.cell(tb, 10, row, pfText(pf1), text_color = na(pf1) ? C_SUB : pf1 >= 1 ? C_GOOD : C_BAD, text_size = size.small)
+        table.cell(tb, 11, row, pfText(pf2), text_color = na(pf2) ? C_SUB : pf2 >= 1 ? C_GOOD : C_BAD, text_size = size.small)
