@@ -4,7 +4,7 @@
 // -----------------------------------------------------------------------------
 //  インジケーター版（MAMA_SelfCross.pine）と同じロジックで売買する。
 //  ・シグナルは足の確定で判定し、注文は次の足の始値で約定（TradingView の既定）
-//  ・手法    : 相互監視（自己相関クロス） / パターンB（短期MAMA × 長期MA）
+//  ・手法    : 相互監視（自己相関クロス） / パターンB（短期MAMA × 長期MA） / パターンC（短期MA × 長期MA）
 //  ・決済    : 逆クロス ＋ 損切り（直近の安値・高値 / ATR 倍）＋ 任意で利確（ATR 倍）
 //  ・スプレッドは再現されないので、プロパティの「スリッページ」に片道ぶん
 //    （スプレッドの半分）をティックで入れておくと実際に近くなる
@@ -17,6 +17,7 @@ strategy("MAMA 自己相関クロス 戦略", shorttitle = "MAMA SelfCross ST", 
 // ---------------------------------------------------------------- 選択肢
 string M_MUTUAL = "相互監視（自己相関クロス）"
 string M_B      = "パターンB（短期MAMA × 長期MA）"
+string M_C      = "パターンC（短期MA × 長期MA）"
 
 string D_BOTH  = "両方"
 string D_LONG  = "買いのみ"
@@ -53,7 +54,7 @@ string G_TEST = "検証期間"
 string G_VIS  = "表示"
 
 // ---------------------------------------------------------------- 入力
-string method    = input.string(M_MUTUAL, "手法", options = [M_MUTUAL, M_B], group = G_SYS, tooltip = "相互監視：小（短期）と大（長期）の自己相関クロスの向きが揃ったら入る。パターンB：短期MAMA と 長期MA のクロスで入り、逆クロスで決済。")
+string method    = input.string(M_MUTUAL, "手法", options = [M_MUTUAL, M_B, M_C], group = G_SYS, tooltip = "相互監視：小（短期）と大（長期）の自己相関クロスの向きが揃ったら入る。パターンB：短期MAMA と 長期MA のクロスで入り、逆クロスで決済。パターンC：短期MA と 長期MA のクロス（普通のゴールデンクロス／デッドクロス）で入り、逆クロスで決済。")
 string direction = input.string(D_BOTH, "売買方向", options = [D_BOTH, D_LONG, D_SHORT], group = G_SYS)
 string trendMode = input.string(TF_OFF, "トレンドフィルター", options = [TF_OFF, TF_PRICE, TF_SLOPE], group = G_SYS, tooltip = "トレンドに逆らわない。トレンドMA を基準に逆方向のエントリーをしない。")
 
@@ -79,7 +80,7 @@ int    startTime = input.time(timestamp("01 Jan 2000 00:00 +0000"), "開始", gr
 int    endTime   = input.time(timestamp("01 Jan 2100 00:00 +0000"), "終了", group = G_TEST)
 
 bool   showLines = input.bool(true, "MA / MAMA ライン", group = G_VIS)
-bool   showArrow = input.bool(true, "小矢印・大矢印（パターンB のときは ○）", group = G_VIS)
+bool   showArrow = input.bool(true, "小矢印・大矢印（パターンB・C のときはクロスに ○）", group = G_VIS)
 bool   showZone  = input.bool(false, "保有中の背景色", group = G_VIS)
 bool   showStop  = input.bool(true, "損切り・利確ライン", group = G_VIS)
 bool   showStats = input.bool(true, "成績パネル", group = G_VIS, inline = "stats")
@@ -122,9 +123,11 @@ float swingHigh = ta.highest(high, swingLen)
 var int fastDir = 0
 var int slowDir = 0
 var int bDir    = 0
+var int cDir    = 0
 fastDir := dirOf(fastMA, fastMAMA, fastDir)
 slowDir := dirOf(slowMA, slowMAMA, slowDir)
 bDir    := dirOf(fastMAMA, slowMA, bDir)
+cDir    := dirOf(fastMA, slowMA, cDir)
 
 bool fastUp = fastDir == 1 and fastDir[1] == -1
 bool fastDn = fastDir == -1 and fastDir[1] == 1
@@ -132,6 +135,8 @@ bool slowUp = slowDir == 1 and slowDir[1] == -1
 bool slowDn = slowDir == -1 and slowDir[1] == 1
 bool bUp    = bDir == 1 and bDir[1] == -1
 bool bDn    = bDir == -1 and bDir[1] == 1
+bool cUp    = cDir == 1 and cDir[1] == -1
+bool cDn    = cDir == -1 and cDir[1] == 1
 
 bool trendUpOk = trendMode == TF_PRICE ? close > trendMA : trendMode == TF_SLOPE ? trendMA > trendMA[1] : true
 bool trendDnOk = trendMode == TF_PRICE ? close < trendMA : trendMode == TF_SLOPE ? trendMA < trendMA[1] : true
@@ -147,9 +152,14 @@ bool useFastTrig = entryMode != EN_BIG
 bool mutualLong  = (useSlowTrig and longBySlow) or (useFastTrig and longByFast)
 bool mutualShort = (useSlowTrig and shortBySlow) or (useFastTrig and shortByFast)
 
+// パターンB・C は 2 本の線のクロスで入り、逆クロスで決済（ドテン）
 bool isB       = method == M_B
-bool longTrig  = (isB ? bUp : mutualLong) and trendUpOk
-bool shortTrig = (isB ? bDn : mutualShort) and trendDnOk
+bool isC       = method == M_C
+bool isCross   = isB or isC
+bool crossUp   = isB ? bUp : cUp
+bool crossDn   = isB ? bDn : cDn
+bool longTrig  = (isCross ? crossUp : mutualLong) and trendUpOk
+bool shortTrig = (isCross ? crossDn : mutualShort) and trendDnOk
 
 // ---------------------------------------------------------------- 売買
 // 実際のポジション（注文は次の足の始値で約定するので、約定後の足から反映される）
@@ -161,8 +171,8 @@ var float longLimit = na
 var float shortStop  = na
 var float shortLimit = na
 
-bool exitLongSig  = isB ? bDn : exitMode == EX_SLOW ? slowDn : exitMode == EX_FAST ? fastDn : (exitMode == EX_AUTO and posKind == 1) ? slowDn : (fastDn or slowDn)
-bool exitShortSig = isB ? bUp : exitMode == EX_SLOW ? slowUp : exitMode == EX_FAST ? fastUp : (exitMode == EX_AUTO and posKind == 1) ? slowUp : (fastUp or slowUp)
+bool exitLongSig  = isCross ? crossDn : exitMode == EX_SLOW ? slowDn : exitMode == EX_FAST ? fastDn : (exitMode == EX_AUTO and posKind == 1) ? slowDn : (fastDn or slowDn)
+bool exitShortSig = isCross ? crossUp : exitMode == EX_SLOW ? slowUp : exitMode == EX_FAST ? fastUp : (exitMode == EX_AUTO and posKind == 1) ? slowUp : (fastUp or slowUp)
 
 bool inRange = time >= startTime and time <= endTime
 bool doLong  = inRange and direction != D_SHORT and longTrig and pos != 1
@@ -178,12 +188,12 @@ if doExitS and not doLong
 
 if doLong
     strategy.entry("Long", strategy.long, comment = "買い")
-    posKind   := (not isB and useSlowTrig and longBySlow) ? 1 : 2
+    posKind   := (not isCross and useSlowTrig and longBySlow) ? 1 : 2
     longStop  := slMode == SL_SWING ? swingLow - slBuffer * syminfo.mintick : slMode == SL_ATR ? close - slAtr * atr : na
     longLimit := tpAtr > 0 ? close + tpAtr * atr : na
 if doShort
     strategy.entry("Short", strategy.short, comment = "売り")
-    posKind    := (not isB and useSlowTrig and shortBySlow) ? 1 : 2
+    posKind    := (not isCross and useSlowTrig and shortBySlow) ? 1 : 2
     shortStop  := slMode == SL_SWING ? swingHigh + slBuffer * syminfo.mintick : slMode == SL_ATR ? close + slAtr * atr : na
     shortLimit := tpAtr > 0 ? close - tpAtr * atr : na
 
@@ -206,13 +216,14 @@ plot(showLines ? slowMA : na, "長期MA", color = C_SLOW, linewidth = 1)
 plot(showLines ? slowMAMA : na, "長期MAMA", color = C_SLOWMM, linewidth = 1)
 plot(showTrend ? trendMA : na, "トレンドMA", color = C_TREND, linewidth = 2)
 
-bool arrowsOn = showArrow and not isB
+bool arrowsOn = showArrow and not isCross
 plotchar(arrowsOn and fastUp, title = "小矢印↑", char = "⇧", location = location.belowbar, color = C_UP, size = size.small)
 plotchar(arrowsOn and fastDn, title = "小矢印↓", char = "⇩", location = location.abovebar, color = C_DN, size = size.small)
 plotshape(arrowsOn and slowUp, title = "大矢印↑", style = shape.arrowup, location = location.belowbar, color = C_UP, size = size.small)
 plotshape(arrowsOn and slowDn, title = "大矢印↓", style = shape.arrowdown, location = location.abovebar, color = C_DN, size = size.small)
-plotchar(showArrow and isB and bUp ? (fastMAMA + slowMA) / 2 : na, title = "パターンB↑", char = "○", location = location.absolute, color = C_UP, size = size.small)
-plotchar(showArrow and isB and bDn ? (fastMAMA + slowMA) / 2 : na, title = "パターンB↓", char = "○", location = location.absolute, color = C_DN, size = size.small)
+float crossY = isB ? (fastMAMA + slowMA) / 2 : (fastMA + slowMA) / 2
+plotchar(showArrow and isCross and crossUp ? crossY : na, title = "クロス↑（パターンB・C）", char = "○", location = location.absolute, color = C_UP, size = size.small)
+plotchar(showArrow and isCross and crossDn ? crossY : na, title = "クロス↓（パターンB・C）", char = "○", location = location.absolute, color = C_DN, size = size.small)
 
 plot(showStop and longActive ? longStop : na, "損切り（買い）", color = C_DN, style = plot.style_linebr, linewidth = 1)
 plot(showStop and shortActive ? shortStop : na, "損切り（売り）", color = C_DN, style = plot.style_linebr, linewidth = 1)
@@ -235,7 +246,7 @@ if showStats and barstate.islast
     float pf      = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
     float netPct  = strategy.netprofit / strategy.initial_capital * 100
     float ddPct   = strategy.max_drawdown / strategy.initial_capital * 100
-    string sysTxt = isB ? "パターンB" : "相互監視"
+    string sysTxt = isB ? "パターンB" : isC ? "パターンC" : "相互監視"
 
     statRow(stats, 0, "MAMA " + str.tostring(fastLen) + " / " + str.tostring(slowLen), sysTxt, color.white)
     statRow(stats, 1, "取引回数", str.tostring(trades), color.white)
