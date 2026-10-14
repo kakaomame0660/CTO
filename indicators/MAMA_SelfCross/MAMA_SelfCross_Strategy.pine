@@ -1,0 +1,231 @@
+//@version=6
+// =============================================================================
+//  MAMA 自己相関クロス ＆ 相互監視 — バックテスト用ストラテジー
+// -----------------------------------------------------------------------------
+//  インジケーター版（MAMA_SelfCross.pine）と同じロジックで売買する。
+//  ・シグナルは足の確定で判定し、注文は次の足の始値で約定（TradingView の既定）
+//  ・手法    : 相互監視（自己相関クロス） / パターンB（短期MAMA × 長期MA）
+//  ・決済    : 逆クロス（＋任意で ATR 倍の損切り・利確）
+//  ・スプレッドは再現されないので、プロパティの「スリッページ」に片道ぶん
+//    （スプレッドの半分）をティックで入れておくと実際に近くなる
+//  ・証拠金率は 4%（国内FXのレバレッジ 25 倍）。100% のままだと、資金 100% の売りが
+//    少し逆行しただけでマージンコールになり成績がゆがむ
+//  ※ MAMA = 「MA の MA」。Ehlers の MESA Adaptive Moving Average とは別物
+// =============================================================================
+strategy("MAMA 自己相関クロス 戦略", shorttitle = "MAMA SelfCross ST", overlay = true, initial_capital = 1000000, default_qty_type = strategy.percent_of_equity, default_qty_value = 100, pyramiding = 0, commission_type = strategy.commission.percent, commission_value = 0, slippage = 0, margin_long = 4, margin_short = 4)
+
+// ---------------------------------------------------------------- 選択肢
+string M_MUTUAL = "相互監視（自己相関クロス）"
+string M_B      = "パターンB（短期MAMA × 長期MA）"
+
+string D_BOTH  = "両方"
+string D_LONG  = "買いのみ"
+string D_SHORT = "売りのみ"
+
+string T_SMA  = "SMA"
+string T_EMA  = "EMA"
+string T_SMMA = "SMMA (RMA)"
+string T_WMA  = "WMA"
+string T_SAME = "MA と同じ"
+
+string EN_BOTH = "両方"
+string EN_BIG  = "小→大（大矢印で入る＝大きく取る）"
+string EN_FINE = "大→小（小矢印で入る＝細かく取る）"
+
+string EX_ANY  = "どちらかの逆クロス（原典ルール）"
+string EX_SLOW = "長期（大）の逆クロスのみ"
+string EX_FAST = "短期（小）の逆クロスのみ"
+string EX_AUTO = "自動（大矢印で入ったら長期／小矢印ならどちらか）"
+
+string TF_OFF   = "OFF"
+string TF_PRICE = "価格がトレンドMAの上なら買いのみ／下なら売りのみ"
+string TF_SLOPE = "トレンドMAの傾きの方向のみ"
+
+string G_SYS  = "手法"
+string G_MA   = "移動平均"
+string G_SIG  = "相互監視の設定"
+string G_RISK = "損切り・利確（任意）"
+string G_TEST = "検証期間"
+string G_VIS  = "表示"
+
+// ---------------------------------------------------------------- 入力
+string method    = input.string(M_MUTUAL, "手法", options = [M_MUTUAL, M_B], group = G_SYS, tooltip = "相互監視：小（短期）と大（長期）の自己相関クロスの向きが揃ったら入る。パターンB：短期MAMA と 長期MA のクロスで入り、逆クロスで決済。")
+string direction = input.string(D_BOTH, "売買方向", options = [D_BOTH, D_LONG, D_SHORT], group = G_SYS)
+string trendMode = input.string(TF_OFF, "トレンドフィルター", options = [TF_OFF, TF_PRICE, TF_SLOPE], group = G_SYS, tooltip = "トレンドに逆らわない。トレンドMA を基準に逆方向のエントリーをしない。")
+
+int    fastLen   = input.int(5, "短期 期間（小矢印）", minval = 1, group = G_MA)
+int    slowLen   = input.int(20, "長期 期間（大矢印）", minval = 1, group = G_MA, tooltip = "5 と 20 は 40・60・80・100… と共通の倍数が多く「つぶしが効く」。5 と 100 にしても考え方は同じで、周期が長くなるだけ。")
+string maType    = input.string(T_SMA, "MA の種類", options = [T_SMA, T_EMA, T_SMMA, T_WMA], group = G_MA)
+string mamaSel   = input.string(T_SAME, "MAMA の種類", options = [T_SAME, T_SMA, T_EMA, T_SMMA, T_WMA], group = G_MA)
+float  src       = input.source(close, "価格", group = G_MA)
+bool   showTrend = input.bool(true, "トレンドMA", group = G_MA, inline = "trend")
+int    trendLen  = input.int(200, "", minval = 1, group = G_MA, inline = "trend")
+
+string entryMode = input.string(EN_BOTH, "エントリー方式", options = [EN_BOTH, EN_BIG, EN_FINE], group = G_SIG, tooltip = "小→大：小矢印が出ている状態で大矢印が出たら入る（大きく取る）。大→小：大矢印が出ている状態で小矢印が出たら入る（細かく取る）。両方：どちらでも向きが揃った時点で入る。")
+string exitMode  = input.string(EX_AUTO, "決済条件", options = [EX_ANY, EX_SLOW, EX_FAST, EX_AUTO], group = G_SIG, tooltip = "自動：大矢印で入ったら長期の逆クロスまで持つ（大きく取る）、小矢印で入ったらどちらかの逆クロスで終了（細かく取る）。原典ルールは「エントリー後、どちらかの MA で逆向きクロスが出たら終了」。")
+
+float  slAtr     = input.float(0.0, "損切り（ATR 倍、0 = なし）", minval = 0, step = 0.5, group = G_RISK)
+float  tpAtr     = input.float(0.0, "利確（ATR 倍、0 = なし）", minval = 0, step = 0.5, group = G_RISK, tooltip = "原典では「絶対クローズ条件は逆クロスだけ、利食いは適当でいい」。0 のままなら逆クロスだけで決済する。")
+int    atrLen    = input.int(14, "ATR 期間", minval = 1, group = G_RISK)
+
+int    startTime = input.time(timestamp("01 Jan 2000 00:00 +0000"), "開始", group = G_TEST)
+int    endTime   = input.time(timestamp("01 Jan 2100 00:00 +0000"), "終了", group = G_TEST)
+
+bool   showLines = input.bool(true, "MA / MAMA ライン", group = G_VIS)
+bool   showArrow = input.bool(true, "小矢印・大矢印（パターンB のときは ○）", group = G_VIS)
+bool   showZone  = input.bool(false, "保有中の背景色", group = G_VIS)
+bool   showStats = input.bool(true, "成績パネル", group = G_VIS, inline = "stats")
+string statsLoc  = input.string("右下", "", options = ["右上", "右下", "左上", "左下"], group = G_VIS, inline = "stats")
+
+// ---------------------------------------------------------------- 色
+color C_FAST   = #FF00FF
+color C_FASTMM = #00FFFF
+color C_SLOW   = #32CD32
+color C_SLOWMM = #FFFF00
+color C_TREND  = #FFA500
+color C_UP     = #00E5FF
+color C_DN     = #FF3B3B
+color C_BUY    = #1E90FF
+color C_SELL   = #FF4500
+
+// ---------------------------------------------------------------- 計算（インジケーター版と同じ）
+ma(float s, simple int len, simple string t) =>
+    float vSma = ta.sma(s, len)
+    float vEma = ta.ema(s, len)
+    float vRma = ta.rma(s, len)
+    float vWma = ta.wma(s, len)
+    t == T_EMA ? vEma : t == T_SMMA ? vRma : t == T_WMA ? vWma : vSma
+
+// a と b の上下関係。同値のときは直前の向きを引き継ぐ
+dirOf(float a, float b, int prev) =>
+    a > b ? 1 : a < b ? -1 : prev
+
+string mamaType = mamaSel == T_SAME ? maType : mamaSel
+
+float fastMA   = ma(src, fastLen, maType)
+float fastMAMA = ma(fastMA, fastLen, mamaType)
+float slowMA   = ma(src, slowLen, maType)
+float slowMAMA = ma(slowMA, slowLen, mamaType)
+float trendMA  = ma(src, trendLen, maType)
+float atr      = ta.atr(atrLen)
+
+var int fastDir = 0
+var int slowDir = 0
+var int bDir    = 0
+fastDir := dirOf(fastMA, fastMAMA, fastDir)
+slowDir := dirOf(slowMA, slowMAMA, slowDir)
+bDir    := dirOf(fastMAMA, slowMA, bDir)
+
+bool fastUp = fastDir == 1 and fastDir[1] == -1
+bool fastDn = fastDir == -1 and fastDir[1] == 1
+bool slowUp = slowDir == 1 and slowDir[1] == -1
+bool slowDn = slowDir == -1 and slowDir[1] == 1
+bool bUp    = bDir == 1 and bDir[1] == -1
+bool bDn    = bDir == -1 and bDir[1] == 1
+
+bool trendUpOk = trendMode == TF_PRICE ? close > trendMA : trendMode == TF_SLOPE ? trendMA > trendMA[1] : true
+bool trendDnOk = trendMode == TF_PRICE ? close < trendMA : trendMode == TF_SLOPE ? trendMA < trendMA[1] : true
+
+// 相互監視：もう片方がすでに同じ向きのときにクロスしたら「向きが揃った」
+bool longBySlow  = slowUp and fastDir == 1     // 小→大（大矢印で入る）
+bool longByFast  = fastUp and slowDir == 1     // 大→小（小矢印で入る）
+bool shortBySlow = slowDn and fastDir == -1
+bool shortByFast = fastDn and slowDir == -1
+
+bool useSlowTrig = entryMode != EN_FINE
+bool useFastTrig = entryMode != EN_BIG
+bool mutualLong  = (useSlowTrig and longBySlow) or (useFastTrig and longByFast)
+bool mutualShort = (useSlowTrig and shortBySlow) or (useFastTrig and shortByFast)
+
+bool isB       = method == M_B
+bool longTrig  = (isB ? bUp : mutualLong) and trendUpOk
+bool shortTrig = (isB ? bDn : mutualShort) and trendDnOk
+
+// ---------------------------------------------------------------- 売買
+// 実際のポジション（注文は次の足の始値で約定するので、約定後の足から反映される）
+int pos = strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0
+
+var int   posKind  = 0      // 1 = 大矢印で建てた、2 = 小矢印で建てた（決済条件「自動」用）
+var float entryAtr = na     // エントリー時の ATR（損切り・利確の幅）
+
+bool exitLongSig  = isB ? bDn : exitMode == EX_SLOW ? slowDn : exitMode == EX_FAST ? fastDn : (exitMode == EX_AUTO and posKind == 1) ? slowDn : (fastDn or slowDn)
+bool exitShortSig = isB ? bUp : exitMode == EX_SLOW ? slowUp : exitMode == EX_FAST ? fastUp : (exitMode == EX_AUTO and posKind == 1) ? slowUp : (fastUp or slowUp)
+
+bool inRange = time >= startTime and time <= endTime
+bool doLong  = inRange and direction != D_SHORT and longTrig and pos != 1
+bool doShort = inRange and direction != D_LONG and shortTrig and pos != -1
+bool doExitL = pos == 1 and exitLongSig
+bool doExitS = pos == -1 and exitShortSig
+
+// 反対方向のエントリーはドテン（strategy.entry が決済も兼ねる）ので、決済注文は出さない
+if doExitL and not doShort
+    strategy.close("Long", comment = "決済")
+if doExitS and not doLong
+    strategy.close("Short", comment = "決済")
+
+if doLong
+    strategy.entry("Long", strategy.long, comment = "買い")
+    posKind  := (not isB and useSlowTrig and longBySlow) ? 1 : 2
+    entryAtr := atr
+if doShort
+    strategy.entry("Short", strategy.short, comment = "売り")
+    posKind  := (not isB and useSlowTrig and shortBySlow) ? 1 : 2
+    entryAtr := atr
+
+// 損切り・利確（ATR 倍）。エントリーした足は終値、約定後は平均取得単価を基準にする
+if (slAtr > 0 or tpAtr > 0) and not na(entryAtr)
+    if doLong or (pos == 1 and not doShort)
+        float baseL = doLong ? close : strategy.position_avg_price
+        float stopL = slAtr > 0 ? baseL - slAtr * entryAtr : na
+        float limL  = tpAtr > 0 ? baseL + tpAtr * entryAtr : na
+        strategy.exit("Long SL/TP", from_entry = "Long", stop = stopL, limit = limL, comment_loss = "損切り", comment_profit = "利確")
+    if doShort or (pos == -1 and not doLong)
+        float baseS = doShort ? close : strategy.position_avg_price
+        float stopS = slAtr > 0 ? baseS + slAtr * entryAtr : na
+        float limS  = tpAtr > 0 ? baseS - tpAtr * entryAtr : na
+        strategy.exit("Short SL/TP", from_entry = "Short", stop = stopS, limit = limS, comment_loss = "損切り", comment_profit = "利確")
+
+// 検証期間が終わったら手じまい
+if time > endTime and strategy.position_size != 0
+    strategy.close_all(comment = "期間終了")
+
+// ---------------------------------------------------------------- 描画
+plot(showLines ? fastMA : na, "短期MA", color = C_FAST, linewidth = 1)
+plot(showLines ? fastMAMA : na, "短期MAMA", color = C_FASTMM, linewidth = 1)
+plot(showLines ? slowMA : na, "長期MA", color = C_SLOW, linewidth = 1)
+plot(showLines ? slowMAMA : na, "長期MAMA", color = C_SLOWMM, linewidth = 1)
+plot(showTrend ? trendMA : na, "トレンドMA", color = C_TREND, linewidth = 2)
+
+bool arrowsOn = showArrow and not isB
+plotchar(arrowsOn and fastUp, title = "小矢印↑", char = "⇧", location = location.belowbar, color = C_UP, size = size.small)
+plotchar(arrowsOn and fastDn, title = "小矢印↓", char = "⇩", location = location.abovebar, color = C_DN, size = size.small)
+plotshape(arrowsOn and slowUp, title = "大矢印↑", style = shape.arrowup, location = location.belowbar, color = C_UP, size = size.small)
+plotshape(arrowsOn and slowDn, title = "大矢印↓", style = shape.arrowdown, location = location.abovebar, color = C_DN, size = size.small)
+plotchar(showArrow and isB and bUp ? (fastMAMA + slowMA) / 2 : na, title = "パターンB↑", char = "○", location = location.absolute, color = C_UP, size = size.small)
+plotchar(showArrow and isB and bDn ? (fastMAMA + slowMA) / 2 : na, title = "パターンB↓", char = "○", location = location.absolute, color = C_DN, size = size.small)
+
+bgcolor(showZone and pos == 1 ? color.new(C_BUY, 90) : showZone and pos == -1 ? color.new(C_SELL, 90) : na, title = "保有中")
+
+// ---------------------------------------------------------------- 成績パネル（詳細はストラテジーテスターで）
+string statsPosition = statsLoc == "右上" ? position.top_right : statsLoc == "左上" ? position.top_left : statsLoc == "左下" ? position.bottom_left : position.bottom_right
+var table stats = table.new(statsPosition, 2, 7, bgcolor = color.new(#000000, 20), frame_color = color.new(#808080, 40), frame_width = 1, border_color = color.new(#808080, 70), border_width = 1)
+
+statRow(table t, int row, string label, string value, color valueColor) =>
+    table.cell(t, 0, row, label, text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, row, value, text_color = valueColor, text_size = size.small, text_halign = text.align_right)
+
+if showStats and barstate.islast
+    int   trades  = strategy.closedtrades
+    float winRate = trades > 0 ? 100.0 * strategy.wintrades / trades : na
+    float pf      = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    float netPct  = strategy.netprofit / strategy.initial_capital * 100
+    float ddPct   = strategy.max_drawdown / strategy.initial_capital * 100
+    string sysTxt = isB ? "パターンB" : "相互監視"
+
+    statRow(stats, 0, "MAMA " + str.tostring(fastLen) + " / " + str.tostring(slowLen), sysTxt, color.white)
+    statRow(stats, 1, "取引回数", str.tostring(trades), color.white)
+    statRow(stats, 2, "勝率", na(winRate) ? "―" : str.tostring(winRate, "0.0") + " %", color.white)
+    statRow(stats, 3, "PF", na(pf) ? "―" : str.tostring(pf, "0.00"), na(pf) ? color.gray : pf >= 1 ? C_UP : C_DN)
+    statRow(stats, 4, "純利益", str.tostring(strategy.netprofit, "0") + "（" + str.tostring(netPct, "0.0") + " %）", strategy.netprofit >= 0 ? C_UP : C_DN)
+    statRow(stats, 5, "最大DD", str.tostring(strategy.max_drawdown, "0") + "（初期資金比 " + str.tostring(ddPct, "0.0") + " %）", C_DN)
+    statRow(stats, 6, "保有中", pos == 1 ? "買い" : pos == -1 ? "売り" : "なし", pos == 1 ? C_BUY : pos == -1 ? C_SELL : color.gray)
