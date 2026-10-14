@@ -8,14 +8,17 @@
 //  ・足が確定したら判定し、次の足の始値（新しい足の最初のティック）で成行注文
 //  ・損切りはポジションの SL として置き、トレーリング・建値ストップは足が確定するごとに更新
 //  ・手法    : 相互監視（自己相関クロス） / パターンB（短期MAMA × 長期MA） / パターンC（短期MA × 長期MA）
-//  ・安全のため、初期設定では本番口座では発注しない（バックテスト・デモ口座だけで動く）
+//  ・安全のため、初期設定ではストラテジーテスターとデモ口座でしか発注しない
+//    （本番口座・口座の種類が確認できないときは、起動しない／注文を出さない）
+//  ・チャートに付けると、その口座で実際に注文を出す。バックテストはストラテジーテスターで行う
 //  ・最適化の基準「カスタム最大」は「純利益 ÷ 最大ドローダウン（有効証拠金）」
 //  ※ MAMA = 「MA の MA」。Ehlers の MESA Adaptive Moving Average とは別物
 //+------------------------------------------------------------------+
 #property copyright   "MAMA SelfCross"
-#property version     "1.00"
+#property version     "1.01"
 #property description "MAMA（MAのMA）自己相関クロス ＆ 相互監視 — 検証用 EA"
-#property description "初期設定では本番口座では発注しません（バックテスト・デモ口座用）"
+#property description "初期設定ではストラテジーテスターとデモ口座でしか発注しません"
+#property description "バックテストはチャートに付けず、ストラテジーテスターで行ってください"
 
 #include <Trade/Trade.mqh>
 
@@ -91,7 +94,7 @@ input double              InpLots          = 0.01;           // ロット数
 input long                InpMagic         = 20261014;       // マジックナンバー
 input int                 InpDeviation     = 30;             // 許容スリッページ（ポイント）
 input int                 InpMaxSpread     = 0;              // 最大スプレッド（ポイント、0 = 制限なし）。超えていたら新規エントリーしない
-input bool                InpAllowReal     = false;          // 本番口座での発注を許可（バックテスト・デモ口座では不要）
+input bool                InpAllowReal     = false;          // 本番口座での発注を許可（危険。バックテスト・デモ口座では false のまま）
 
 input group "■ 手法"
 input ENUM_MAMA_METHOD    InpMethod        = METHOD_MUTUAL;  // 手法
@@ -191,10 +194,10 @@ int OnInit()
       return(INIT_PARAMETERS_INCORRECT);
      }
 
-   bool tester = (MQLInfoInteger(MQL_TESTER) != 0 || MQLInfoInteger(MQL_OPTIMIZATION) != 0);
-   if(!tester && AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_REAL && !InpAllowReal)
+   if(!TradingPermitted())
      {
-      Alert("MAMA SelfCross EA: 本番口座では発注しない設定です。本番で動かす場合は「本番口座での発注を許可」を true にしてください。");
+      Alert("MAMA SelfCross EA: 本番口座（またはデモ口座と確認できない口座）なので停止しました。" +
+            "バックテストはチャートに付けず、ストラテジーテスター（Ctrl+R）で行ってください。");
       return(INIT_FAILED);
      }
 
@@ -243,6 +246,11 @@ void OnTick()
    datetime t = iTime(_Symbol, g_tf, 0);
    if(t == 0 || t == g_lastBar)
       return;
+   if(g_lastBar == 0)
+     {
+      g_lastBar = t;     // 起動して最初に見た足では判定しない（足の途中から入らないように）
+      return;
+     }
    if(!ProcessBar())
       return;            // データがまだ揃っていなければ次のティックでやり直す
    g_lastBar = t;
@@ -601,6 +609,8 @@ void OpenPosition(const int dir, const bool bySlow, const Signals &s)
    sl = (sl > 0.0) ? NormalizeDouble(sl, _Digits) : 0.0;
    tp = (tp > 0.0) ? NormalizeDouble(tp, _Digits) : 0.0;
 
+   if(!TradingPermitted())
+      return;
    double lots = NormalizeLots(InpLots);
    bool   ok   = (dir == 1) ? g_trade.Buy(lots, _Symbol, 0.0, sl, tp, "MAMA L")
                              : g_trade.Sell(lots, _Symbol, 0.0, sl, tp, "MAMA S");
@@ -667,6 +677,8 @@ void ManageStop(const int pos, const double avg, const double curSL, const doubl
      }
    if(curSL > 0.0 && ((pos == 1 && eff <= curSL) || (pos == -1 && eff >= curSL)))
       return;
+   if(!TradingPermitted())
+      return;
    if(!g_trade.PositionModify(ticket, eff, curTP))
       Print("MAMA SelfCross EA: 損切りを更新できませんでした（", g_trade.ResultRetcode(), "）");
   }
@@ -676,11 +688,27 @@ void ManageStop(const int pos, const double avg, const double curSL, const doubl
 //+------------------------------------------------------------------+
 void ClosePosition(const ulong ticket)
   {
-   if(ticket == 0)
+   if(ticket == 0 || !TradingPermitted())
       return;
    if(!g_trade.PositionClose(ticket, (ulong)InpDeviation))
       Print("MAMA SelfCross EA: 決済できませんでした（", g_trade.ResultRetcode(), "）");
    g_state = false;
+  }
+
+//--- 発注してよいか：ストラテジーテスター、デモ口座と確認できた口座、または本番を明示的に許可したとき
+bool TradingPermitted()
+  {
+   if(MQLInfoInteger(MQL_TESTER) != 0 || MQLInfoInteger(MQL_OPTIMIZATION) != 0)
+      return(true);
+   if(InpAllowReal)
+      return(true);
+   if(AccountInfoInteger(ACCOUNT_LOGIN) <= 0)
+      return(false);                                    // 口座に接続していない＝種類が分からない
+   ResetLastError();
+   long mode = AccountInfoInteger(ACCOUNT_TRADE_MODE);
+   if(GetLastError() != 0)
+      return(false);
+   return(mode == ACCOUNT_TRADE_MODE_DEMO);
   }
 
 bool SpreadOk()
